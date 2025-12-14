@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture-Reactive Particle Heart</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050508; /* Deep cosmic black */
+            font-family: 'Segoe UI', sans-serif;
+            color: white;
+            user-select: none;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        /* Hide the raw webcam video */
+        .input_video { display: none; }
+
+        /* UI Overlay */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 10;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            padding: 40px;
+            box-sizing: border-box;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            font-size: 1.2rem;
+            color: #ff6b95;
+            text-shadow: 0 0 15px #ff6b95;
+            transition: opacity 0.5s ease;
+        }
+
+        .controls-info {
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 12px;
+            max-width: 400px;
+            border-left: 3px solid #ff6b95;
+        }
+
+        h1 { margin: 0 0 10px 0; font-size: 1.5rem; letter-spacing: 1px; }
+        p { margin: 6px 0; font-size: 0.9rem; color: #ccc; }
+        .tag { color: #fff; font-weight: bold; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <!-- Loading Indicator -->
+    <div id="loading">
+        Initializing Vision AI...<br>
+        <small style="opacity:0.7">Please allow camera access</small>
+    </div>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer">
+        <div class="controls-info">
+            <h1>Particle Heart</h1>
+            <p>👋 <span class="tag">Move</span> to Rotate</p>
+            <p>↕️ <span class="tag">Depth</span> affects Warm/Cool colors</p>
+            <p>⚡ <span class="tag">Speed</span> affects Brightness/Neon</p>
+            <p>✨ <span class="tag">Touch</span> to drag particles</p>
+        </div>
+    </div>
+
+    <!-- Hidden Video Element -->
+    <video class="input_video"></video>
+    
+    <!-- 3D Canvas -->
+    <div id="canvas-container"></div>
+
+    <!-- Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // ==========================================
+        // 1. CONFIGURATION & STATE
+        // ==========================================
+        const CONFIG = {
+            particleCount: 5000,
+            ambientCount: 500,
+            heartSize: 14,
+            interactionRadius: 8.0,
+            dragStrength: 0.15,
+            returnStrength: 0.03
+        };
+
+        const state = {
+            handDetected: false,
+            // Smooth Values (for jitter reduction)
+            rotX: 0, rotY: 0, depthZ: 0,
+            handPos: new THREE.Vector3(1000, 1000, 1000), // Start far away
+            prevHandPos: new THREE.Vector3(1000, 1000, 1000),
+            handSpeed: 0
+        };
+
+        // ==========================================
+        // 2. SCENE SETUP
+        // ==========================================
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x050508, 0.02); // Cosmic fog
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 45;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // ==========================================
+        // 3. TEXTURE GENERATION
+        // ==========================================
+        // Create a soft glowing dot programmatically
+        function createGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            
+            const grad = ctx.createRadialGradient(16,16,0,16,16,16);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.2, 'rgba(255,255,255,0.8)');
+            grad.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            
+            ctx.fillStyle = grad;
+            ctx.fillRect(0,0,32,32);
+            return new THREE.CanvasTexture(canvas);
+        }
+        const particleTexture = createGlowTexture();
+
+        // ==========================================
+        // 4. PARTICLE SYSTEM CREATION
+        // ==========================================
+        const geometry = new THREE.BufferGeometry();
+        const positions = [];
+        const homes = [];     // Target positions (Heart shape)
+        const velocities = [];
+        const colors = [];
+        const sizes = [];
+
+        // --- Heart Generation Logic (Rejection Sampling) ---
+        // Equation: (x^2 + 9/4y^2 + z^2 - 1)^3 - x^2z^3 - 9/80y^2z^3 < 0
+        let i = 0;
+        while (i < CONFIG.particleCount) {
+            const x = (Math.random() * 2 - 1) * 1.5;
+            const y = (Math.random() * 2 - 1) * 1.5;
+            const z = (Math.random() * 2 - 1) * 1.5;
+
+            const a = x*x + 2.25*y*y + z*z - 1;
+            const val = a*a*a - x*x*z*z*z - 0.1125*y*y*z*z*z;
+
+            if (val < 0) {
+                // Point is inside the heart volume!
+                
+                // Rotate and Scale to stand upright
+                const px = x * CONFIG.heartSize;
+                const py = z * CONFIG.heartSize;     // Swap Y and Z for upright
+                const pz = y * CONFIG.heartSize * 0.5; // Flatten depth
+
+                positions.push(px, py, pz);
+                homes.push(px, py, pz);
+                velocities.push(0, 0, 0); // Start still
+                
+                // Initial Color (Magenta base)
+                colors.push(1.0, 0.2, 0.5); 
+                sizes.push(Math.random() * 0.5 + 0.2);
+                i++;
+            }
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+
+        // Create the Mesh
+        const material = new THREE.PointsMaterial({
+            size: 0.8,
+            map: particleTexture,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.8
+        });
+
+        const heartMesh = new THREE.Points(geometry, material);
+        scene.add(heartMesh);
+
+        // --- Ambient Stardust ---
+        const ambientGeo = new THREE.BufferGeometry();
+        const ambPos = [];
+        for(let j=0; j<CONFIG.ambientCount; j++){
+            ambPos.push(
+                (Math.random() - 0.5) * 100,
+                (Math.random() - 0.5) * 100,
+                (Math.random() - 0.5) * 80
+            );
+        }
+        ambientGeo.setAttribute('position', new THREE.Float32BufferAttribute(ambPos, 3));
+        const ambientMat = new THREE.PointsMaterial({
+            size: 0.3, color: 0x88ccff, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending
+        });
+        const ambientMesh = new THREE.Points(ambientGeo, ambientMat);
+        scene.add(ambientMesh);
+
+
+        // ==========================================
+        // 5. MEDIAPIPE HAND TRACKING
+        // ==========================================
+        const videoElement = document.getElementsByClassName('input_video')[0];
+
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                state.handDetected = true;
+                const landmarks = results.multiHandLandmarks[0];
+
+                // Get Hand Center (Approx at index knuckle)
+                const x = landmarks[9].x; 
+                const y = landmarks[9].y;
+                const z = landmarks[9].z; // Relative depth
+
+                // Update Interaction Targets
+                // Rotation: Map screen X/Y to rotations
+                state.rotY = (x - 0.5) * 2.5; // Yaw
+                state.rotX = (y - 0.5) * 2.5; // Pitch
+
+                // Push/Pull: Map Z
+                state.depthZ = z * -50; 
+
+                // Project 2D hand to 3D world for particle dragging
+                const vector = new THREE.Vector3(
+                    (1 - x) * 2 - 1, // Flip X
+                    -(y * 2 - 1),    // Flip Y
+                    0.5
+                );
+                vector.unproject(camera);
+                const dir = vector.sub(camera.position).normalize();
+                const dist = 45 + state.depthZ; // Approximate depth plane
+                const targetPos = camera.position.clone().add(dir.multiplyScalar(dist));
+                
+                // Calculate Speed for color change
+                const speed = targetPos.distanceTo(state.prevHandPos);
+                state.handSpeed = THREE.MathUtils.lerp(state.handSpeed, speed, 0.1);
+                
+                state.prevHandPos.copy(targetPos);
+                state.handPos.copy(targetPos);
+
+            } else {
+                state.handDetected = false;
+                state.handSpeed = 0;
+                // Slowly return to center
+                state.rotX *= 0.95;
+                state.rotY *= 0.95;
+                state.depthZ *= 0.95;
+                state.handPos.set(1000,1000,1000);
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        // ==========================================
+        // 6. PHYSICS & ANIMATION LOOP
+        // ==========================================
+        const clock = new THREE.Clock();
+        
+        // Helper to handle local space transformation
+        function getLocalHand() {
+            // Because the heart rotates, we must rotate the hand position inversely 
+            // to find where the hand is relative to the particles
+            const p = state.handPos.clone();
+            p.sub(heartMesh.position);
+            const invEuler = new THREE.Euler(-heartMesh.rotation.x, -heartMesh.rotation.y, 0);
+            p.applyEuler(invEuler);
+            return p;
+        }
+
+        // Color helpers
+        const colWarm = new THREE.Color(1.0, 0.2, 0.0); // Orange/Red
+        const colCool = new THREE.Color(0.2, 0.0, 1.0); // Purple/Blue
+        const colNeon = new THREE.Color(1.0, 1.0, 1.0); // White hot
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            // 1. Smooth Global Transforms (Lerping)
+            heartMesh.rotation.x += (state.rotX - heartMesh.rotation.x) * 0.1;
+            heartMesh.rotation.y += (state.rotY - heartMesh.rotation.y) * 0.1;
+            heartMesh.position.z += (state.depthZ - heartMesh.position.z) * 0.1;
+
+            // 2. Pulse Effect
+            const pulse = 1 + Math.sin(time * 2.5) * 0.03;
+            heartMesh.scale.set(pulse, pulse, pulse);
+
+            // 3. Determine Target Color based on Gesture
+            // Depth Factor: 0 (Close) to 1 (Far) normalized roughly
+            let depthFactor = THREE.MathUtils.clamp((state.depthZ + 10) / 20, 0, 1); 
+            // Base color lerp between Warm and Cool based on Z
+            let targetColor = new THREE.Color().lerpColors(colWarm, colCool, depthFactor);
+            
+            // Speed Factor: If moving fast, mix in Neon White
+            const speedFactor = THREE.MathUtils.clamp(state.handSpeed * 2.0, 0, 1);
+            targetColor.lerp(colNeon, speedFactor);
+
+            // 4. Particle Physics Loop
+            const posAttr = geometry.attributes.position;
+            const colAttr = geometry.attributes.color;
+            const pArr = posAttr.array;
+            const cArr = colAttr.array;
+            const localHand = getLocalHand();
+
+            // Calculate hand velocity vector in local space for "Drag" effect
+            const handVel = state.handPos.clone().sub(state.prevHandPos).multiplyScalar(10); 
+
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                const idx = i * 3;
+
+                // --- Physics ---
+                let px = pArr[idx];
+                let py = pArr[idx+1];
+                let pz = pArr[idx+2];
+                
+                let vx = velocities[idx];
+                let vy = velocities[idx+1];
+                let vz = velocities[idx+2];
+
+                // a. Return to Home (Spring Force)
+                const hx = homes[idx];
+                const hy = homes[idx+1];
+                const hz = homes[idx+2];
+                
+                vx += (hx - px) * CONFIG.returnStrength;
+                vy += (hy - py) * CONFIG.returnStrength;
+                vz += (hz - pz) * CONFIG.returnStrength;
+
+                // b. Hand Interaction (Magnetic Drag)
+                const dx = px - localHand.x;
+                const dy = py - localHand.y;
+                const dz = pz - localHand.z;
+                const distSq = dx*dx + dy*dy + dz*dz;
+
+                if (distSq < CONFIG.interactionRadius ** 2) {
+                    const dist = Math.sqrt(distSq);
+                    const force = (1 - dist / CONFIG.interactionRadius);
+                    
+                    // Attraction to finger
+                    vx -= dx * force * 0.1;
+                    vy -= dy * force * 0.1;
+                    vz -= dz * force * 0.1;
+
+                    // Drag flow (add hand movement)
+                    vx += handVel.x * force * CONFIG.dragStrength;
+                    vy += handVel.y * force * CONFIG.dragStrength;
+                    vz += handVel.z * force * CONFIG.dragStrength;
+                }
+
+                // c. Noise/Turbulence
+                vx += Math.sin(time * 3 + py * 0.5) * 0.005;
+                vy += Math.cos(time * 3 + px * 0.5) * 0.005;
+
+                // d. Apply & Dampen
+                vx *= 0.92; vy *= 0.92; vz *= 0.92;
+                px += vx; py += vy; pz += vz;
+
+                // Update Position Arrays
+                pArr[idx] = px;
+                pArr[idx+1] = py;
+                pArr[idx+2] = pz;
+                velocities[idx] = vx;
+                velocities[idx+1] = vy;
+                velocities[idx+2] = vz;
+
+                // --- Color Transition ---
+                // Smoothly lerp current particle color to the global targetColor
+                // We do this per particle to create a "wave" effect if we wanted, 
+                // but here it ensures smooth transition over time.
+                const curC = new THREE.Color(cArr[idx], cArr[idx+1], cArr[idx+2]);
+                curC.lerp(targetColor, 0.05); // 0.05 is the color transition speed
+                
+                cArr[idx] = curC.r;
+                cArr[idx+1] = curC.g;
+                cArr[idx+2] = curC.b;
+            }
+
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+
+            // Ambient dust rotation
+            ambientMesh.rotation.y = time * 0.05;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

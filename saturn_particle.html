@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cinematic AI Particle Saturn</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+            z-index: 10;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffff;
+            font-size: 24px;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            text-shadow: 0 0 10px #00ffff;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border: 1px solid #00ffff;
+        }
+
+        .hud-text {
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 12px;
+            text-shadow: 0 0 5px rgba(0, 255, 255, 0.5);
+        }
+
+        #video-feed {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 160px;
+            height: 120px;
+            border: 1px solid #333;
+            opacity: 0.5;
+            transform: scaleX(-1); /* Mirror preview */
+            z-index: 5;
+            display: none; /* Hidden, used for texture */
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer">
+        <div class="hud-text">SYSTEM: ONLINE<br>MODE: REACTIVE PARTICLE FLUID<br>INPUT: CAM_01</div>
+        <div id="loading">INITIALIZING SYSTEMS...</div>
+        <div class="hud-text" style="text-align: right;">HAND TRACKING: ACTIVE<br>VISUALS: BLOOM ENABLED</div>
+    </div>
+
+    <!-- Hidden Video Element -->
+    <video id="video-feed" playsinline muted autoplay></video>
+
+    <!-- Import Maps -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/+esm"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- Configuration ---
+        const CONFIG = {
+            particleCountPlanet: 25000,
+            particleCountRing: 15000,
+            planetRadius: 20,
+            ringInner: 30,
+            ringOuter: 55,
+            particleSize: 0.8,
+            expansionStrength: 20.0, // How much particles pop out
+            bloomStrength: 1.5,
+            bloomThreshold: 0.1,
+            bloomRadius: 0.5
+        };
+
+        // --- Globals ---
+        let scene, camera, renderer, composer;
+        let video, videoTexture;
+        let saturnGroup, planetParticles, ringParticles, stars;
+        let handLandmarker;
+        let isLoaded = false;
+        
+        // Interaction State
+        const targetRotation = new THREE.Vector2(0, 0);
+        const currentRotation = new THREE.Vector2(0, 0);
+        let targetScale = 1.0;
+        let currentScale = 1.0;
+
+        // --- Shaders ---
+        
+        // Vertex Shader: Reads video texture and displaces particles
+        const vertexShader = `
+            uniform sampler2D uTexture;
+            uniform float uTime;
+            uniform float uExpansion;
+            
+            varying vec3 vColor;
+            varying float vBrightness;
+
+            // Helper to get luminance
+            float getBrightness(vec3 color) {
+                return dot(color, vec3(0.299, 0.587, 0.114));
+            }
+
+            void main() {
+                // Read color from video texture based on UV mapping
+                vec4 texColor = texture2D(uTexture, uv);
+                float brightness = getBrightness(texColor.rgb);
+                vBrightness = brightness;
+
+                // Color calculation: Mix video color with a sci-fi cyan/purple tint
+                vec3 baseColor = texColor.rgb;
+                vec3 sciFiColor = mix(vec3(0.1, 0.6, 1.0), vec3(1.0, 0.2, 0.8), brightness);
+                vColor = mix(baseColor, sciFiColor, 0.3);
+
+                // DISPLACEMENT LOGIC
+                // Move vertex along its normal vector based on brightness
+                vec3 newPos = position + (normal * brightness * uExpansion);
+
+                // Add subtle wave movement
+                newPos.x += sin(uTime * 2.0 + position.y * 0.5) * 0.5;
+
+                vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+
+                // Size attenuation (particles smaller when further away)
+                gl_PointSize = (1.5 + brightness * 3.0) * (300.0 / -mvPosition.z);
+            }
+        `;
+
+        // Fragment Shader: Handles particle shape and glow
+        const fragmentShader = `
+            varying vec3 vColor;
+            varying float vBrightness;
+
+            void main() {
+                // Circular particle shape
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if (dist > 0.5) discard;
+
+                // Soft edge glow
+                float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
+                
+                // Boost brightness for bloom effect
+                vec3 finalColor = vColor * (1.0 + vBrightness * 2.0);
+
+                gl_FragColor = vec4(finalColor, alpha);
+            }
+        `;
+
+        async function init() {
+            // 1. Setup Video Input
+            video = document.getElementById('video-feed');
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480, facingMode: "user" } 
+                });
+                video.srcObject = stream;
+                await video.play();
+            } catch (err) {
+                console.error("Camera denied:", err);
+                document.getElementById('loading').innerText = "CAMERA ACCESS REQUIRED";
+                return;
+            }
+
+            videoTexture = new THREE.VideoTexture(video);
+            videoTexture.minFilter = THREE.LinearFilter;
+            videoTexture.magFilter = THREE.LinearFilter;
+            videoTexture.format = THREE.RGBAFormat;
+
+            // 2. Setup Three.js
+            scene = new THREE.Scene();
+            // Fog for depth
+            scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 100;
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap pixel ratio for performance
+            document.body.appendChild(renderer.domElement);
+
+            // 3. Post Processing (Bloom)
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = CONFIG.bloomThreshold;
+            bloomPass.strength = CONFIG.bloomStrength;
+            bloomPass.radius = CONFIG.bloomRadius;
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 4. Create Objects
+            createSaturn();
+            createStars();
+
+            // 5. Initialize AI Hand Tracking
+            await initHandTracker();
+
+            // 6. Start Loop
+            document.getElementById('loading').style.display = 'none';
+            isLoaded = true;
+            window.addEventListener('resize', onResize);
+            animate();
+        }
+
+        function createSaturn() {
+            saturnGroup = new THREE.Group();
+            
+            const shaderMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTexture: { value: videoTexture },
+                    uTime: { value: 0 },
+                    uExpansion: { value: CONFIG.expansionStrength }
+                },
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending
+            });
+
+            // --- PLANET SPHERE ---
+            const planetGeo = new THREE.SphereGeometry(CONFIG.planetRadius, 128, 128);
+            planetParticles = new THREE.Points(planetGeo, shaderMaterial);
+            saturnGroup.add(planetParticles);
+
+            // --- RINGS ---
+            // Create a custom ring geometry made of points
+            const ringGeo = new THREE.BufferGeometry();
+            const ringPos = [];
+            const ringUvs = [];
+            const ringNormals = [];
+
+            for (let i = 0; i < CONFIG.particleCountRing; i++) {
+                // Random angle
+                const angle = Math.random() * Math.PI * 2;
+                // Random radius within ring band
+                const radius = CONFIG.ringInner + Math.random() * (CONFIG.ringOuter - CONFIG.ringInner);
+                
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                const y = (Math.random() - 0.5) * 0.5; // Slight thickness
+
+                ringPos.push(x, y, z);
+                
+                // Map UVs cylindrically or planar so video projects onto ring
+                // Here we map planar:
+                ringUvs.push((x / CONFIG.ringOuter) * 0.5 + 0.5, (z / CONFIG.ringOuter) * 0.5 + 0.5);
+                
+                // Normal pointing up/out
+                ringNormals.push(0, 1, 0);
+            }
+
+            ringGeo.setAttribute('position', new THREE.Float32BufferAttribute(ringPos, 3));
+            ringGeo.setAttribute('uv', new THREE.Float32BufferAttribute(ringUvs, 2));
+            ringGeo.setAttribute('normal', new THREE.Float32BufferAttribute(ringNormals, 3));
+
+            ringParticles = new THREE.Points(ringGeo, shaderMaterial);
+            // Tilt the rings
+            ringParticles.rotation.x = 0.2; 
+            ringParticles.rotation.z = 0.1; 
+            
+            saturnGroup.add(ringParticles);
+
+            // Rotate whole group to face camera nicely initially
+            saturnGroup.rotation.x = 0.3;
+            saturnGroup.rotation.z = 0.2;
+
+            scene.add(saturnGroup);
+        }
+
+        function createStars() {
+            const starGeo = new THREE.BufferGeometry();
+            const starCount = 2000;
+            const pos = [];
+            for(let i=0; i<starCount; i++) {
+                const x = (Math.random() - 0.5) * 600;
+                const y = (Math.random() - 0.5) * 600;
+                const z = (Math.random() - 0.5) * 600;
+                pos.push(x,y,z);
+            }
+            starGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            const starMat = new THREE.PointsMaterial({color: 0xffffff, size: 0.5, transparent: true, opacity: 0.6});
+            stars = new THREE.Points(starGeo, starMat);
+            scene.add(stars);
+        }
+
+        async function initHandTracker() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+        }
+
+        function detectHands() {
+            if (!handLandmarker || !video || video.readyState < 2) return;
+
+            // Perform detection
+            let startTimeMs = performance.now();
+            const results = handLandmarker.detectForVideo(video, startTimeMs);
+
+            if (results.landmarks && results.landmarks.length > 0) {
+                const hand = results.landmarks[0]; // Get first hand
+                
+                // Use Index Finger Tip (8) or Wrist (0) for position
+                const indexTip = hand[8];
+                const wrist = hand[0];
+
+                // 1. Map X coordinate to Rotation Y
+                // Hand X is 0 (left) to 1 (right). Map to -1.5 to 1.5 rads
+                const xPos = 1.0 - indexTip.x; // Mirror it
+                const yPos = 1.0 - indexTip.y;
+
+                targetRotation.y = (xPos - 0.5) * 4.0; // Rotation range
+                targetRotation.x = (yPos - 0.5) * 2.0;
+
+                // 2. Map Hand Area (Z-depth approximation) to Scale
+                // Simple distance between wrist and index tip
+                const dx = indexTip.x - wrist.x;
+                const dy = indexTip.y - wrist.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                // Normal hand size is roughly 0.15 - 0.3 in screen coords
+                // If dist is small (hand far away), scale down. Large = scale up.
+                const normalizedDist = Math.min(Math.max(dist, 0.1), 0.4);
+                targetScale = 0.5 + (normalizedDist * 3.0); 
+
+            } else {
+                // Idle animation if no hand
+                targetRotation.x = 0.3;
+                targetRotation.y += 0.001; // Slow spin
+                targetScale = 1.0;
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (!isLoaded) return;
+
+            const time = performance.now() * 0.001;
+
+            // 1. Update Video Texture
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                videoTexture.needsUpdate = true;
+                detectHands(); // Run AI
+            }
+
+            // 2. Smooth Interaction
+            // Lerp rotation
+            currentRotation.x += (targetRotation.x - currentRotation.x) * 0.05;
+            currentRotation.y += (targetRotation.y - currentRotation.y) * 0.05;
+            
+            // Lerp scale
+            currentScale += (targetScale - currentScale) * 0.05;
+
+            if (saturnGroup) {
+                // Apply transformations
+                saturnGroup.rotation.y = currentRotation.y + time * 0.1; // Add constant spin
+                saturnGroup.rotation.x = currentRotation.x + 0.3; // + offset tilt
+                
+                saturnGroup.scale.setScalar(currentScale);
+
+                // Update Shader Uniforms
+                planetParticles.material.uniforms.uTime.value = time;
+                ringParticles.material.uniforms.uTime.value = time;
+            }
+
+            // 3. Ambient movement
+            if (stars) {
+                stars.rotation.y = time * 0.02;
+            }
+
+            // 4. Render with Bloom
+            composer.render();
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>
